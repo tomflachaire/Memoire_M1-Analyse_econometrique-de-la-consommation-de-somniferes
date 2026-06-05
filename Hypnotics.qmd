@@ -1,0 +1,453 @@
+---
+title: "Consommation de somnifères en France : une exception au regard des autres pays de l’OCDE ?"
+author: "Tom Flachaire"
+format: pdf
+---
+
+## Importation de la base de donnée
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(here)
+library(tidyr)
+library(lmtest)
+library(plm)
+library(kableExtra)
+
+# Import des fichiers
+OECD_hypnotics <- read_excel(
+  "Data/OECD_hypnotics.xlsx",
+  skip = 4   # saute les 4 premières lignes
+)
+OECD_age <- read_excel("Data/OECD_age.xlsx", skip = 5)
+OECD_GDP <- read_excel("Data/OECD_GDP.xlsx", skip = 3)
+OECD_health_expanditure <- read_excel("Data/OECD_health_expanditure.xlsx", 
+                                      skip = 4)
+OECD_heat_stress <- read_excel("Data/OECD_heat_stress.xlsx", skip = 5)
+OECD_pharmacists <- read_excel("Data/OECD_pharmacists.xlsx", skip = 5)
+OECD_work <- read_excel("Data/OECD_work.xlsx", skip = 5)
+WHR_wellbeing <- read_excel("Data/WHR_wellbeing.xlsx")
+```
+
+## Data cleaning
+
+Pour les bases de données de l'OCDE :
+
+```{r}
+#| message: false
+#| warning: false
+clean_oecd <- function(df) {
+  
+  # Renommer la première colonne
+  colnames(df)[1] <- "pays"
+  
+  # Supprimer les colonnes inutiles si elles existent
+  df <- df %>%
+    select(-any_of(c("Time period...2", "Time period...3", "...16", 
+                     "...17", "...18", "2010")))
+  
+  # Supprimer les lignes non pertinentes si elles existent
+  df <- df %>%
+    filter(!pays %in% c(
+      "Reference area",
+      "Price base: Chain linked volume (rebased)",
+      "Combined reference area",
+      "© Terms & conditions",
+      "G20",
+      "European Union (27 countries)",
+      "OECD",
+      "World",
+      "G7",
+      "Euro area (20 countries)",
+      "European Union (27 countries from 01/02/2020)",
+      "OECD Europe",
+      "© Conditions d'utilisation",
+      "Canada", # pays sans valeur dans la base de données OECD_work
+      "Korea", # pays qui n'existe pas dans la base de données OECD_work
+      "Hungary", 
+      "Italy",
+      "Poland" # pays sans valeur dans la data hypnotics (Hungary et Poland)
+    ))
+  
+  return(df)
+}
+
+OECD_age <- clean_oecd(OECD_age)
+OECD_hypnotics <- clean_oecd(OECD_hypnotics)
+OECD_GDP <- clean_oecd(OECD_GDP)
+OECD_health_expanditure <- clean_oecd(OECD_health_expanditure)
+OECD_heat_stress <- clean_oecd(OECD_heat_stress)
+OECD_pharmacists <- clean_oecd(OECD_pharmacists)
+OECD_work <- clean_oecd(OECD_work)
+
+# Retirer ", Country" uniquement pour Heat Stress
+OECD_heat_stress <- OECD_heat_stress %>%
+  mutate(pays = gsub(", Country$", "", pays))
+
+```
+
+On crée la fonction pivot_longer qui nous permet de changer le format
+
+```{r}
+pivot_oecd_long <- function(df, value_name) {
+  
+  df_long <- df %>%
+    pivot_longer(
+      cols = matches("^20"), # toutes les colonnes commençant par 20 = années
+      names_to = "annee",
+      values_to = value_name
+    ) %>%
+    mutate(
+      annee = as.numeric(annee),
+      !!value_name := as.numeric(.data[[value_name]]) # conversion en numérique
+    )
+  
+  return(df_long)
+}
+```
+
+On applique la fonction
+
+```{r}
+OECD_hypnotics_long <- pivot_oecd_long(OECD_hypnotics, "hypnotics")
+
+OECD_age_long <- pivot_oecd_long(OECD_age, "age65")
+OECD_GDP_long <- pivot_oecd_long(OECD_GDP, "GDPpc")
+OECD_health_expanditure_long <- pivot_oecd_long(OECD_health_expanditure, 
+                                                "health_exp")
+OECD_heat_stress_long <- pivot_oecd_long(OECD_heat_stress, "heat_stress")
+OECD_pharmacists_long <- pivot_oecd_long(OECD_pharmacists, "pharmacists")
+OECD_work_long <- pivot_oecd_long(OECD_work, "work")
+```
+
+La base est désormais sous forme “longue” (long format), avec une ligne par pays et par année, ce qui permet d’analyser facilement l’évolution temporelle et de fusionner les variables pour créer un panel.
+
+Pour la base de donnée de l'WHR :
+
+```{r}
+#| message: false
+#| warning: false
+
+clean_whr_wellbeing <- function(df) {
+  
+  df_clean <- df %>%
+    
+    # Garder uniquement les variables nécessaires
+    select(pays, annee, wellbeing) %>%
+    
+    # Conversion en numérique
+    mutate(
+      annee = as.numeric(annee),
+      wellbeing = as.numeric(wellbeing)
+    ) %>%
+    
+    # Supprimer les agrégats 
+    filter(!pays %in% c(
+      "OECD",
+      "European Union",
+      "World",
+      "G7",
+      "G20"
+    ))
+  
+  return(df_clean)
+}
+
+WHR_wellbeing <- clean_whr_wellbeing(WHR_wellbeing)
+
+```
+
+On crée désormais notre propre base de donnée
+
+```{r}
+panel <- OECD_hypnotics_long %>%
+  left_join(OECD_age_long, by = c("pays", "annee")) %>%
+  left_join(OECD_GDP_long, by = c("pays", "annee")) %>%
+  left_join(OECD_health_expanditure_long, by = c("pays", "annee")) %>%
+  left_join(OECD_heat_stress_long, by = c("pays", "annee")) %>%
+  left_join(OECD_pharmacists_long, by = c("pays", "annee")) %>%
+  left_join(OECD_work_long, by = c("pays", "annee"))
+
+panel <- panel %>%
+  left_join(WHR_wellbeing, by = c("pays", "annee"))
+
+```
+
+On supprime les NA et valeurs nulles pour obtenir une base de donnée nettoyée.
+
+```{r}
+final_data <- panel %>%
+  filter(!is.na(hypnotics) & hypnotics > 0) %>%
+  filter(!is.na(wellbeing)) %>%
+  filter(!is.na(pharmacists)) %>%
+  mutate(
+    log_hypnotics = log(hypnotics)
+  )
+```
+
+La base de donnée "final_data" est celle qu'on utilisera pour notre analyse empirique. Nous avons pu la construire à l'aide de différentes bases de données provenant de l'OCDE et de la WHR. 
+Nous regroupons des données de 2011 à 2023 de 21 pays de l'OCDE.
+
+## Modèle économétrique
+
+Statistiques descriptives
+
+```{r}
+final_data %>%
+  select(
+    `Hypnotiques (DDD/1000/j)` = hypnotics,
+    `65 ans et + (%)` = age65,
+    `PIB/hab (USD)` = GDPpc,
+    `Dépenses santé (% PIB)` = health_exp,
+    `Pharmaciens (/1000 hab)` = pharmacists,
+    `Jours >32°C` = heat_stress,
+    `Bien-être (0-10)` = wellbeing,
+    `Heures travaillées` = work
+  ) %>%
+  summarise(across(everything(), list(
+    Moyenne   = ~round(mean(., na.rm = TRUE), 2),
+    `Éc. type` = ~round(sd(., na.rm = TRUE), 2),
+    Min       = ~round(min(., na.rm = TRUE), 2),
+    Max       = ~round(max(., na.rm = TRUE), 2)
+  ))) %>%
+  pivot_longer(
+    everything(),
+    names_to  = c("Variable", ".value"),
+    names_sep = "_"
+  ) %>%
+  kable(
+    caption = "Statistiques descriptives",
+    align   = c("l", "r", "r", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, color = "#e74c3c")  
+```
+
+Modèle économétrique
+
+```{r}
+# Modèle à effets fixes (pays + année)
+pdata_clean <- pdata.frame(final_data, index = c("pays", "annee"))
+
+model <- plm(
+  log_hypnotics ~ age65 + GDPpc + health_exp + pharmacists + 
+                  heat_stress + wellbeing + work,
+  data = pdata_clean,
+  index = c("pays", "annee"),
+  model = "within",
+  effect = "twoways"  # effets fixes pays et année simultanément
+)
+
+summary(model)
+```
+
+
+age65 (−0.020, non significatif)
+Le signe est négatif, ce qui va à l'encontre de l'hypothèse initiale. Cela s'explique probablement par le fait que les effets fixes pays absorbent l'essentiel de la variation démographique structurelle entre pays — les pays vieillissants sont les mêmes d'une année sur l'autre. La variation within restante, c'est-à-dire le vieillissement marginal d'une année à l'autre à l'intérieur d'un même pays, est trop lente pour produire un effet détectable sur la consommation à court terme. Le coefficient est de toute façon non significatif.
+GDPpc (+0.000017, significatif à 10%)
+Le signe positif est cohérent avec l'hypothèse : une augmentation du PIB par habitant est associée à une légère hausse de la consommation d'hypnotiques, reflétant un meilleur accès aux soins et une plus grande médicalisation des troubles du sommeil dans les pays plus riches. L'effet est très faible en magnitude mais marginalement significatif.
+health_exp (−0.029, non significatif)
+Le signe négatif est contre-intuitif — on attendait qu'un système de santé plus généreux stimule la consommation. Une interprétation possible est qu'un système de santé qui dépense davantage investit aussi dans des alternatives non médicamenteuses et dans des politiques de déprescription, réduisant in fine le recours aux hypnotiques. Le coefficient reste cependant non significatif, ce qui invite à la prudence.
+pharmacists (−0.335, non significatif)
+Le signe négatif est également surprenant. Une densité plus élevée de pharmaciens pourrait en réalité favoriser le conseil à la déprescription et orienter les patients vers des alternatives, plutôt que de simplement faciliter l'accès au médicament. Là encore le coefficient n'est pas significatif, et ce résultat doit être interprété avec précaution.
+heat_stress (−0.00076, non significatif)
+Le signe est négatif, contraire à l'hypothèse climatique. Il est possible que la variation annuelle du nombre de jours chauds à l'intérieur d'un même pays soit trop faible et trop bruitée pour produire un effet détectable sur la consommation agrégée d'hypnotiques. Le coefficient est très proche de zéro et clairement non significatif.
+wellbeing (+0.161, significatif à 1%)
+C'est le seul coefficient fortement significatif du modèle, mais son signe est positif — là où on attendait un signe négatif. Une année où le bien-être subjectif augmente dans un pays est associée à une consommation d'hypnotiques plus élevée. Ce résultat contre-intuitif mérite discussion : il est possible que le bien-être capte ici un effet de richesse ou de développement du système de santé non absorbé par le PIB, ou qu'il reflète un biais de causalité inverse — les patients qui consomment des hypnotiques et dorment mieux se déclarent plus satisfaits de leur vie. C'est la limite d'endogénéité mentionnée dans la stratégie empirique.
+work (+0.004, non significatif)
+Le signe est positif et cohérent avec l'hypothèse — plus d'heures travaillées, plus de stress, plus de recours aux hypnotiques — mais l'effet est quasi nul et clairement non significatif.
+
+Résultats 
+
+```{r}
+# Extraire les résultats du modèle
+resultats <- summary(model)$coefficients
+
+# Mettre en forme
+data.frame(
+  Variable = c("Part 65+ ans (%)", "PIB par habitant", 
+                "Dépenses de santé (% PIB)", "Pharmaciens (/1000 hab)",
+                "Stress thermique (jours >32°C)", "Bien-être subjectif (0-10)", 
+                "Heures travaillées"),
+  Coefficient = round(resultats[, "Estimate"], 5),
+  `Écart-type` = round(resultats[, "Std. Error"], 5),
+  `t-value`    = round(resultats[, "t-value"], 3),
+  `p-value`    = round(resultats[, "Pr(>|t|)"], 3),
+  Significativité = ifelse(resultats[, "Pr(>|t|)"] < 0.01, "***",
+                    ifelse(resultats[, "Pr(>|t|)"] < 0.05, "**",
+                    ifelse(resultats[, "Pr(>|t|)"] < 0.1,  "*", "")))
+) %>%
+  kable(
+    caption = "Déterminants de la consommation d'hypnotiques",
+    align   = c("l", "r", "r", "r", "r", "c")
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  footnote(general = "* p<0.1 / ** p<0.05 / *** p<0.01. Effets fixes pays et année inclus.")
+```
+
+```{r}
+# Modèle pooled OLS (sans effets fixes)
+model_ols <- lm(
+  log_hypnotics ~ age65 + GDPpc + health_exp + pharmacists + 
+                  heat_stress + wellbeing + work,
+  data = final_data
+)
+
+summary(model_ols)
+```
+
+```{r}
+# Extraire les coefficients des deux modèles
+coef_ols <- summary(model_ols)$coefficients
+coef_fe  <- summary(model)$coefficients
+
+# Variables d'intérêt
+vars <- c("age65", "GDPpc", "health_exp", "pharmacists", 
+          "heat_stress", "wellbeing", "work")
+
+labels <- c("Part 65+ ans (%)", "PIB par habitant (USD)", 
+            "Dépenses de santé (% PIB)", "Pharmaciens (/1000 hab)",
+            "Stress thermique (jours >32°C)", "Bien-être subjectif (0-10)", 
+            "Heures travaillées")
+
+# Fonction pour formater coef + étoiles
+format_coef <- function(coefs, var) {
+  est <- round(coefs[var, "Estimate"], 5)
+  pval <- coefs[var, "Pr(>|t|)"]
+  stars <- ifelse(pval < 0.01, "***",
+           ifelse(pval < 0.05, "**",
+           ifelse(pval < 0.1,  "*", "")))
+  se <- paste0("(", round(coefs[var, "Std. Error"], 5), ")")
+  list(coef = paste0(est, stars), se = se)
+}
+
+# Construction du tableau
+tableau <- data.frame(
+  Variable = labels,
+  OLS_coef = sapply(vars, function(v) format_coef(coef_ols, v)$coef),
+  OLS_se   = sapply(vars, function(v) format_coef(coef_ols, v)$se),
+  FE_coef  = sapply(vars, function(v) format_coef(coef_fe, v)$coef),
+  FE_se    = sapply(vars, function(v) format_coef(coef_fe, v)$se)
+)
+
+# Renommer les colonnes
+colnames(tableau) <- c("Variable", 
+                       "OLS_coef", "OLS_se",
+                       "FE_coef", "FE_se")
+
+tableau %>%
+  kable(
+    caption = "Comparaison OLS et effets fixes",
+    align   = c("l", "r", "r", "r", "r"),
+    row.names = FALSE   
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  add_header_above(c(" " = 1, 
+                     "OLS sans effets fixes" = 2, 
+                     "OLS avec effets fixes" = 2)) %>%
+  footnote(general = "* p<0.1  ** p<0.05  *** p<0.01. Écarts-types entre parenthèses.")
+```
+
+
+## Graphiques
+
+```{r}
+#| warning: false
+# Moyenne OCDE par année
+avg_oecd <- final_data %>%
+  group_by(annee) %>%
+  summarise(mean_hyp = mean(hypnotics, na.rm = TRUE))
+
+# Données France
+france_hyp <- final_data %>%
+  filter(pays == "France")
+
+# Graphique
+ggplot() +
+  geom_line(data = avg_oecd, aes(x = annee, y = mean_hyp, color = "Moyenne OCDE"), 
+            size = 1) +
+  geom_line(data = france_hyp, aes(x = annee, y = hypnotics, color = "France"), 
+            size = 1.2) +
+  scale_color_manual(
+    name   = NULL,
+    values = c("Moyenne OCDE" = "blue", "France" = "red")
+  ) +
+  labs(
+    title    = "Évolution de la consommation d'hypnotiques (OCDE vs France)",
+    subtitle = "DDD pour 1000 habitants par jour (2011–2023)",
+    x        = "Année",
+    y        = "Consommation d'hypnotiques (DDD/1000/jour)",
+    caption  = "Source : Données OCDE"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title   = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "bottom"
+  )
+```
+
+La France reste un outlier mais il a y a une convergence
+
+```{r}
+# On crée un graphique avec tous les pays
+ggplot(final_data, aes(x = annee, y = hypnotics, group = pays)) +
+  # Toutes les lignes pays en gris clair
+  geom_line(color = "grey80", size = 0.8) +
+  # France en rouge
+  geom_line(data = final_data %>% filter(pays == "France"), 
+            aes(x = annee, y = hypnotics), color = "red", size = 1.2) +
+  labs(
+    title = "Évolution de la consommation d’hypnotiques (2011–2023)",
+    subtitle = "Pays OCDE (gris), France en rouge",
+    x = "Année",
+    y = "Consommation d’hypnotiques (DDD/1000 habitants/jour)",
+    caption = "Source: Données OCDE"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10)
+  )
+```
+
+
+```{r}
+ggplot(final_data, aes(x = reorder(pays, hypnotics, median), y = hypnotics)) +
+  geom_boxplot(fill = "grey90", outlier.size = 1) +
+  geom_boxplot(
+    data = final_data %>% filter(pays == "France"),
+    fill = "#e74c3c", alpha = 0.7
+  ) +
+  coord_flip() +
+  labs(
+    title = "Distribution de la consommation d'hypnotiques par pays (2011–2023)",
+    x = NULL,
+    y = "DDD / 1000 habitants / jour",
+    caption = "Source : OCDE. France en rouge."
+  ) +
+  theme_minimal()
+```
+
+
+Test de Breusch-Pagan : hétéroscédasticité des résidus
+
+```{r}
+bptest(model)
+```
+
+p < 0.05 → hétéroscédasticité → corriger avec erreurs standard robustes
+
